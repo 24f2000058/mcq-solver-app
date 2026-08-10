@@ -21,7 +21,7 @@ import gradio as gr
 import spaces
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"   
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"  
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 OPTION_LETTERS = ["A", "B", "C", "D", "E"]
 GPU_CALL_DURATION = 30   # seconds declared to the ZeroGPU scheduler 
@@ -51,6 +51,7 @@ def wikipedia_context(query: str, num_articles: int = 3, chars_per_article: int 
         search_resp.raise_for_status()
         hits = search_resp.json().get("query", {}).get("search", [])
         titles = [h["title"] for h in hits]
+        print(f"[wikipedia_context] query={query!r} -> {len(titles)} hits: {titles}")
 
         snippets = []
         for title in titles:
@@ -68,8 +69,11 @@ def wikipedia_context(query: str, num_articles: int = 3, chars_per_article: int 
                 extract = page.get("extract", "")
                 if extract:
                     snippets.append(extract[:chars_per_article])
-        return " ".join(snippets)
-    except requests.RequestException:
+        result = " ".join(snippets)
+        print(f"[wikipedia_context] retrieved {len(result)} chars of context")
+        return result
+    except requests.RequestException as e:
+        print(f"[wikipedia_context] request failed: {e}")
         return ""
 
 
@@ -98,14 +102,20 @@ def rank_options(context: str, question: str, options: dict) -> list:
         {"role": "user", "content": user_prompt},
     ]
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    # response prefilling: append the start of the expected answer so the
+    # model continues directly into letters instead of opening with its own
+    # preamble, which was eating the entire token budget before any letter
+    # appeared and causing the regex parse below to come up empty.
+    text += "Ranking:"
     inputs = tokenizer(text, return_tensors="pt").to("cuda")
 
     with torch.no_grad():
         output_ids = model.generate(
-            **inputs, max_new_tokens=20, do_sample=False,
+            **inputs, max_new_tokens=40, do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
     generated = tokenizer.decode(output_ids[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+    print(f"[rank_options] raw model output: {generated!r}")
 
     # parse ranked letters out of the free-text response, de-duplicated, in order
     found = re.findall(r"\b([A-E])\b", generated)
@@ -113,6 +123,8 @@ def rank_options(context: str, question: str, options: dict) -> list:
     for letter in found:
         if letter in letters and letter not in ranked:
             ranked.append(letter)
+    if not ranked:
+        print("[rank_options] WARNING: no letters parsed from model output — falling back to input order")
     # fallback: if parsing came up short, fill remaining slots in the model's
     # own original option order so the output is always well-formed
     for letter in letters:
