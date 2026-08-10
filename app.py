@@ -1,33 +1,42 @@
 """
-Smart MCQ Solver — RAG-powered Gradio app.
+Smart MCQ Solver — RAG-powered Gradio app, ZeroGPU edition.
 
-Retrieves live context from Wikipedia for any question, then scores each
-answer option using google/flan-t5-base's next-token log-likelihood over
-the option letters. No local model checkpoints or FAISS index required —
-everything needed is downloaded once at Space startup (the flan-t5-base
-weights) and every query hits Wikipedia's public API live.
+Retrieves live context from Wikipedia for any question, then asks
+Qwen2.5-3B-Instruct to rank the options directly via its own instruction-
+following (rather than a manual logit-reading trick, which is more fragile
+across different tokenizers/chat templates). Inference runs inside a
+@spaces.GPU-decorated function so it only claims a physical GPU for the
+few seconds it's actually needed; a lightweight /health route lets an
+external pinger keep the Space's CPU container warm without touching any
+GPU quota at all.
 """
 
+import re
 import requests
 import torch
 import gradio as gr
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import spaces
+from fastapi import FastAPI
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-MODEL_NAME = "google/flan-t5-base"
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"   # swap to Qwen/Qwen2.5-1.5B-Instruct for a lighter/faster option
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 OPTION_LETTERS = ["A", "B", "C", "D", "E"]
+GPU_CALL_DURATION = 30   # seconds declared to the ZeroGPU scheduler — keep this tight and realistic
 
 print(f"Loading {MODEL_NAME} ...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
+model.to("cuda")   # safe at module level on ZeroGPU — the physical GPU attaches transparently
+                    # only during @spaces.GPU-decorated calls, this just prepares the model for it
 model.eval()
-DECODER_START_ID = model.config.decoder_start_token_id
 print("Model loaded.")
 
 
 def wikipedia_context(query: str, num_articles: int = 3, chars_per_article: int = 600) -> str:
     """Live retrieval: search Wikipedia, pull the intro extract of the top
-    matching articles. No local index — works for any topic at query time."""
+    matching articles. No local index — works for any topic at query time.
+    Runs on the CPU container, no GPU needed."""
     try:
         search_resp = requests.get(
             WIKI_API,
@@ -62,39 +71,52 @@ def wikipedia_context(query: str, num_articles: int = 3, chars_per_article: int 
         return ""
 
 
-def score_options(context: str, question: str, options: dict) -> list:
-    """Single forward pass through flan-t5-base; reads the model's logit
-    for each option letter as the first generated token, rather than
-    generating text and parsing it. Only scores options the user filled in,
-    so this works for 2-way, 3-way, 4-way, or 5-way questions."""
+@spaces.GPU(duration=GPU_CALL_DURATION)
+def rank_options(context: str, question: str, options: dict) -> list:
+    """The only GPU-touching step. Asks the instruct model directly for a
+    ranked list of option letters via its chat template, then parses the
+    response with a regex rather than relying on next-token logits — more
+    robust across models than the manual scoring trick, at the cost of not
+    returning calibrated probabilities (we report rank order instead)."""
     letters = [l for l in OPTION_LETTERS if options.get(l, "").strip()]
     if not letters:
         return []
 
     opts_block = "\n".join(f"{l}: {options[l]}" for l in letters)
-    input_text = (
+    user_prompt = (
         f"Context: {context[:1500]}\n\n"
-        f"Use the context above to answer this multiple-choice question.\n"
-        f"Question: {question}\nOptions:\n{opts_block}\n"
-        f"The correct answer is:"
+        f"Question: {question}\n"
+        f"Options:\n{opts_block}\n\n"
+        f"Rank these options from most to least likely to be correct. "
+        f"Respond with ONLY the option letters separated by spaces, most likely first "
+        f"(e.g. \"{letters[0]} {letters[1]}\"). Do not explain."
     )
-
-    inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512)
-    decoder_input_ids = torch.tensor([[DECODER_START_ID]])
+    messages = [
+        {"role": "system", "content": "You are a precise assistant that answers multiple-choice questions."},
+        {"role": "user", "content": user_prompt},
+    ]
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(text, return_tensors="pt").to("cuda")
 
     with torch.no_grad():
-        outputs = model(
-            input_ids=inputs.input_ids,
-            attention_mask=inputs.attention_mask,
-            decoder_input_ids=decoder_input_ids,
+        output_ids = model.generate(
+            **inputs, max_new_tokens=20, do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
         )
-    logits = outputs.logits[0, 0, :]
+    generated = tokenizer.decode(output_ids[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
 
-    option_token_ids = {l: tokenizer.encode(l, add_special_tokens=False)[0] for l in letters}
-    raw_scores = torch.tensor([logits[option_token_ids[l]].item() for l in letters])
-    probs = torch.softmax(raw_scores, dim=0)
+    # parse ranked letters out of the free-text response, de-duplicated, in order
+    found = re.findall(r"\b([A-E])\b", generated)
+    ranked = []
+    for letter in found:
+        if letter in letters and letter not in ranked:
+            ranked.append(letter)
+    # fallback: if parsing came up short, fill remaining slots in the model's
+    # own original option order so the output is always well-formed
+    for letter in letters:
+        if letter not in ranked:
+            ranked.append(letter)
 
-    ranked = sorted(zip(letters, probs.tolist()), key=lambda x: -x[1])
     return ranked
 
 
@@ -106,11 +128,11 @@ def answer_mcq(question, a, b, c, d, e):
         return "Please fill in at least two options.", "", ""
 
     context = wikipedia_context(question)
-    ranked = score_options(context, question, options)
+    ranked = rank_options(context, question, options)
 
     top3 = ranked[:3]
-    top3_str = " ".join(letter for letter, _ in top3)
-    detail = "\n".join(f"{letter}: {options[letter]}  \u2014  {prob:.1%}" for letter, prob in ranked)
+    top3_str = " ".join(top3)
+    detail = "\n".join(f"{i+1}. {letter}: {options[letter]}" for i, letter in enumerate(ranked))
     context_preview = (context[:500] + "...") if len(context) > 500 else context
     if not context_preview:
         context_preview = "(no Wikipedia context found for this question — answer is based on the model's own knowledge only)"
@@ -122,8 +144,8 @@ with gr.Blocks(title="Smart MCQ Solver") as demo:
     gr.Markdown(
         "# Smart MCQ Solver\n"
         "Answers multiple-choice questions on **any topic** by retrieving live context "
-        "from Wikipedia and scoring each option with a language model — no fine-tuning "
-        "on a fixed question set required."
+        "from Wikipedia and ranking each option with Qwen2.5-3B-Instruct on a ZeroGPU-backed "
+        "A100 — no fine-tuning on a fixed question set required."
     )
     with gr.Row():
         with gr.Column():
@@ -136,7 +158,7 @@ with gr.Blocks(title="Smart MCQ Solver") as demo:
             submit = gr.Button("Answer", variant="primary")
         with gr.Column():
             top3_out = gr.Textbox(label="Top-3 prediction (Kaggle submission format)")
-            detail_out = gr.Textbox(label="Ranked probabilities", lines=6)
+            detail_out = gr.Textbox(label="Full ranking", lines=6)
             context_out = gr.Textbox(label="Retrieved Wikipedia context (preview)", lines=6)
 
     submit.click(answer_mcq, inputs=[question, a, b, c, d, e], outputs=[top3_out, detail_out, context_out])
@@ -149,5 +171,20 @@ with gr.Blocks(title="Smart MCQ Solver") as demo:
         inputs=[question, a, b, c, d, e],
     )
 
+
+# --- FastAPI wrapper: adds a lightweight /health route alongside the Gradio UI ---
+# A pinger hitting /health never touches rank_options(), so it costs zero
+# ZeroGPU quota — it only keeps the CPU container from sleeping.
+app = FastAPI()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+app = gr.mount_gradio_app(app, demo, path="/")
+
 if __name__ == "__main__":
-    demo.launch()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
