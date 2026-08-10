@@ -1,12 +1,9 @@
 ---
 title: Smart MCQ Solver
-colorFrom: blue
-colorTo: purple
 sdk: gradio
 app_file: app.py
 pinned: false
 license: mit
-sdk_version: 6.22.0
 ---
 
 # Smart MCQ Solver
@@ -43,12 +40,18 @@ work on any topic rather than a fixed question set.
 - The model is loaded and moved to `"cuda"` at module level (Space
   startup), which is the standard ZeroGPU pattern — the physical GPU
   attaches transparently only during decorated calls.
-- A `/health` endpoint is mounted alongside the Gradio UI via
-  `gr.mount_gradio_app`. It does not call the GPU-decorated function, so
-  pinging it costs **zero ZeroGPU quota** — it only keeps the Space's CPU
-  container from sleeping (free-tier Spaces sleep after 48h idle). See
-  `.github/workflows/keep-warm.yml` for a scheduled GitHub Actions ping
-  every 5 hours.
+- The app launches with the standard `demo.launch()` — a custom
+  FastAPI/uvicorn server loop was tried first but conflicts with
+  ZeroGPU's own internal process management (the `spaces` package does
+  multiprocessing under the hood), causing a port-binding crash. Plain
+  `demo.launch()` is what every working ZeroGPU example uses.
+- A background daemon thread (`_self_ping_loop`) periodically makes a
+  real HTTP request to this Space's own public URL (read from the
+  `SPACE_HOST`/`SPACE_ID` environment variables HF sets automatically).
+  That request is genuine external traffic from HF's routing layer's
+  point of view, so it resets the 48h idle-sleep timer — no GitHub
+  Actions or external cron needed. It only hits the root page, never the
+  GPU-decorated function, so it costs zero ZeroGPU quota.
 
 ## Notes
 
