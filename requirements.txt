@@ -1,4 +1,6 @@
 gradio
 transformers
 torch
+accelerate
 requests
+spaces
