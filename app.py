@@ -6,23 +6,25 @@ Qwen2.5-3B-Instruct to rank the options directly via its own instruction-
 following (rather than a manual logit-reading trick, which is more fragile
 across different tokenizers/chat templates). Inference runs inside a
 @spaces.GPU-decorated function so it only claims a physical GPU for the
-few seconds it's actually needed; a lightweight /health route lets an
-external pinger keep the Space's CPU container warm without touching any
-GPU quota at all.
+few seconds it's actually needed. A background thread periodically pings
+this Space's own public URL to keep the CPU container from sleeping,
+without touching any GPU quota.
 """
 
 import re
+import os
+import time
+import threading
 import requests
 import torch
 import gradio as gr
 import spaces
-from fastapi import FastAPI
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"   # swap to Qwen/Qwen2.5-1.5B-Instruct for a lighter/faster option
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"   
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 OPTION_LETTERS = ["A", "B", "C", "D", "E"]
-GPU_CALL_DURATION = 30   # seconds declared to the ZeroGPU scheduler — keep this tight and realistic
+GPU_CALL_DURATION = 30   # seconds declared to the ZeroGPU scheduler 
 
 print(f"Loading {MODEL_NAME} ...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -172,19 +174,36 @@ with gr.Blocks(title="Smart MCQ Solver") as demo:
     )
 
 
-# --- FastAPI wrapper: adds a lightweight /health route alongside the Gradio UI ---
-# A pinger hitting /health never touches rank_options(), so it costs zero
-# ZeroGPU quota — it only keeps the CPU container from sleeping.
-app = FastAPI()
+def _self_ping_loop(interval_seconds: int = 5 * 60 * 60):
+    """Runs in a background daemon thread. Periodically makes a real HTTP
+    request to this Space's own public URL — the request goes out through
+    HF's routing layer and back, which counts as genuine traffic and resets
+    the 48h idle-sleep timer. Hits the root page, not the GPU-decorated
+    function, so this never touches ZeroGPU quota. No-op if the Space's
+    public hostname isn't available (e.g. running locally)."""
+    host = os.environ.get("SPACE_HOST")
+    if not host:
+        space_id = os.environ.get("SPACE_ID")   # format: "username/spacename"
+        if space_id and "/" in space_id:
+            username, space_name = space_id.split("/", 1)
+            host = f"{username}-{space_name}.hf.space".lower()
+
+    if not host:
+        print("Self-ping disabled: not running on a Hugging Face Space.")
+        return
+
+    url = f"https://{host}/"
+    print(f"Self-ping enabled, will hit {url} every {interval_seconds/3600:.1f}h")
+
+    while True:
+        time.sleep(interval_seconds)
+        try:
+            resp = requests.get(url, timeout=15)
+            print(f"Self-ping: {resp.status_code}")
+        except requests.RequestException as e:
+            print(f"Self-ping failed: {e}")
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+threading.Thread(target=_self_ping_loop, daemon=True).start()
 
-
-app = gr.mount_gradio_app(app, demo, path="/")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+demo.launch()
